@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>班级管理系统</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f5f7fb; color: #172033; }
+    header { background: #1d4ed8; color: white; padding: 24px max(24px, calc((100vw - 1120px) / 2)); }
+    header h1 { margin: 0 0 6px; font-size: 30px; }
+    header p { margin: 0; opacity: .9; }
+    main { max-width: 1120px; margin: 24px auto; padding: 0 24px 40px; display: grid; gap: 20px; grid-template-columns: 360px 1fr; }
+    section { background: white; border-radius: 14px; box-shadow: 0 10px 30px rgb(15 23 42 / 8%); padding: 20px; }
+    h2 { margin: 0 0 16px; font-size: 20px; }
+    form { display: grid; gap: 12px; margin-bottom: 18px; }
+    label { display: grid; gap: 6px; color: #475569; font-size: 14px; }
+    input, select, button { border-radius: 10px; border: 1px solid #cbd5e1; padding: 10px 12px; font: inherit; }
+    button { background: #2563eb; border-color: #2563eb; color: white; cursor: pointer; font-weight: 700; }
+    button.secondary { background: #eef2ff; border-color: #c7d2fe; color: #1d4ed8; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .list { display: grid; gap: 10px; }
+    .card { border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; background: #fff; }
+    .card.active { border-color: #2563eb; box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); }
+    .row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .muted { color: #64748b; font-size: 13px; }
+    .error { color: #b91c1c; background: #fee2e2; border-radius: 10px; padding: 10px; display: none; }
+    .empty { color: #64748b; border: 1px dashed #cbd5e1; border-radius: 12px; padding: 18px; text-align: center; }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>班级管理系统</h1>
+    <p>Rust + Axum + SQLite，支持班级和学生信息维护。</p>
+  </header>
+  <main>
+    <section>
+      <h2>班级</h2>
+      <form id="class-form">
+        <label>班级名称<input name="name" placeholder="例如：三年级一班" required></label>
+        <label>班主任<input name="teacher" placeholder="例如：王老师" required></label>
+        <label>教室<input name="room" placeholder="例如：301" required></label>
+        <button type="submit">新增班级</button>
+      </form>
+      <div id="class-error" class="error"></div>
+      <div id="classes" class="list"></div>
+    </section>
+    <section>
+      <div class="row">
+        <h2 id="students-title">学生</h2>
+        <button id="refresh" class="secondary" type="button">刷新</button>
+      </div>
+      <form id="student-form">
+        <label>姓名<input name="name" placeholder="例如：张三" required></label>
+        <label>年龄<input name="age" type="number" min="1" value="10" required></label>
+        <label>性别<select name="gender"><option>男</option><option>女</option></select></label>
+        <label>联系电话<input name="phone" placeholder="可选"></label>
+        <button id="student-submit" type="submit" disabled>新增学生</button>
+      </form>
+      <div id="student-error" class="error"></div>
+      <div id="students" class="list"><div class="empty">请选择一个班级</div></div>
+    </section>
+  </main>
+  <script>
+    const classesEl = document.querySelector('#classes');
+    const studentsEl = document.querySelector('#students');
+    const classForm = document.querySelector('#class-form');
+    const studentForm = document.querySelector('#student-form');
+    const studentSubmit = document.querySelector('#student-submit');
+    const studentsTitle = document.querySelector('#students-title');
+    const classError = document.querySelector('#class-error');
+    const studentError = document.querySelector('#student-error');
+    let classes = [];
+    let selectedClass = null;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { 'content-type': 'application/json', ...(options.headers || {}) },
+        ...options,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: '请求失败' }));
+        throw new Error(error.error || '请求失败');
+      }
+      return response.json();
+    }
+
+    function showError(target, error) {
+      target.textContent = error.message;
+      target.style.display = 'block';
+    }
+
+    function clearError(target) {
+      target.textContent = '';
+      target.style.display = 'none';
+    }
+
+    function renderClasses() {
+      if (classes.length === 0) {
+        classesEl.innerHTML = '<div class="empty">暂无班级，请先新增。</div>';
+        return;
+      }
+      classesEl.innerHTML = classes.map(item => `
+        <div class="card ${selectedClass?.id === item.id ? 'active' : ''}">
+          <div class="row">
+            <strong>${escapeHtml(item.name)}</strong>
+            <button class="secondary" type="button" data-class-id="${item.id}">查看学生</button>
+          </div>
+          <div class="muted">班主任：${escapeHtml(item.teacher)} · 教室：${escapeHtml(item.room)}</div>
+        </div>
+      `).join('');
+      classesEl.querySelectorAll('[data-class-id]').forEach(button => {
+        button.addEventListener('click', () => selectClass(Number(button.dataset.classId)));
+      });
+    }
+
+    function renderStudents(students) {
+      if (!selectedClass) {
+        studentsTitle.textContent = '学生';
+        studentSubmit.disabled = true;
+        studentsEl.innerHTML = '<div class="empty">请选择一个班级</div>';
+        return;
+      }
+      studentsTitle.textContent = `${selectedClass.name} 学生`;
+      studentSubmit.disabled = false;
+      studentsEl.innerHTML = students.length === 0
+        ? '<div class="empty">该班级暂无学生。</div>'
+        : students.map(item => `
+          <div class="card">
+            <strong>${escapeHtml(item.name)}</strong>
+            <div class="muted">${item.age} 岁 · ${escapeHtml(item.gender)} · ${escapeHtml(item.phone || '无联系电话')}</div>
+          </div>
+        `).join('');
+    }
+
+    async function loadClasses() {
+      classes = await api('/api/classes');
+      if (selectedClass) {
+        selectedClass = classes.find(item => item.id === selectedClass.id) || null;
+      }
+      renderClasses();
+      if (selectedClass) await loadStudents();
+    }
+
+    async function selectClass(id) {
+      selectedClass = classes.find(item => item.id === id) || null;
+      renderClasses();
+      await loadStudents();
+    }
+
+    async function loadStudents() {
+      if (!selectedClass) return renderStudents([]);
+      const students = await api(`/api/classes/${selectedClass.id}/students`);
+      renderStudents(students);
+    }
+
+    classForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      clearError(classError);
+      const data = Object.fromEntries(new FormData(classForm));
+      try {
+        const created = await api('/api/classes', { method: 'POST', body: JSON.stringify(data) });
+        classForm.reset();
+        selectedClass = created;
+        await loadClasses();
+      } catch (error) {
+        showError(classError, error);
+      }
+    });
+
+    studentForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!selectedClass) return;
+      clearError(studentError);
+      const data = Object.fromEntries(new FormData(studentForm));
+      data.age = Number(data.age);
+      data.phone = data.phone || null;
+      try {
+        await api(`/api/classes/${selectedClass.id}/students`, { method: 'POST', body: JSON.stringify(data) });
+        studentForm.reset();
+        studentForm.elements.age.value = 10;
+        await loadStudents();
+      } catch (error) {
+        showError(studentError, error);
+      }
+    });
+
+    document.querySelector('#refresh').addEventListener('click', async () => {
+      await loadClasses();
+      await loadStudents();
+    });
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>'"]/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+      }[char]));
+    }
+
+    loadClasses().catch(error => showError(classError, error));
+  </script>
+</body>
+</html>
