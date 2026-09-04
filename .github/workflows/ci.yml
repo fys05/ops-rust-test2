@@ -153,7 +153,9 @@ jobs:
       - name: Server-side dry-run
         run: |
           set -eu
-          kubectl apply --server-side --dry-run=server -f k8s/app/ -f k8s/postgres/ -f k8s/ingress.yaml -f k8s/ingress-http.yaml
+          # NOTE: resources are owned by deploy.py's field manager (Python-urllib).
+          # Server-side apply would conflict; use plain server dry-run instead.
+          kubectl apply --dry-run=server -f k8s/app/ -f k8s/postgres/ -f k8s/ingress.yaml -f k8s/ingress-http.yaml
       - name: Deploy app
         env:
           K8S_CERT_B64: ${{ secrets.K8S_CLIENT_CERT }}
