@@ -110,7 +110,7 @@ pub async fn init_db(pool: &PgPool) -> Result<(), sqlx::Error> {
             id BIGSERIAL PRIMARY KEY,
             class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
-            age INTEGER NOT NULL,
+            age BIGINT NOT NULL,
             gender TEXT NOT NULL,
             phone TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
