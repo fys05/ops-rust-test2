@@ -50,7 +50,9 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --verbose
+        # tests share one postgres DB and reset schema; serialize to avoid
+        # create-table sequence races (pg_class_relname_nsp_index)
+        run: cargo test --verbose -- --test-threads=1
 
   build-and-push:
     needs: [lint, test]
