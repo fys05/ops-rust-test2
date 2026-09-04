@@ -1,0 +1,226 @@
+name: CI/CD
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  RUST_VERSION: "stable"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings -A clippy::uninlined_format_args -A clippy::bind_instead_of_map -A clippy::map_flatten
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --verbose
+
+  build-and-push:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.lc.outputs.image }}
+      image_digest: ${{ steps.lc.outputs.image }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: lc
+        run: echo "image=$(echo '${{ env.REGISTRY }}/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.lc.outputs.image }}:${{ github.sha }}
+            ${{ steps.lc.outputs.image }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    concurrency:
+      group: production-${{ vars.K8S_NAMESPACE }}-${{ vars.APP_NAME }}-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.31.0"
+      - name: Preflight and build kubeconfig
+        env:
+          CERT_B64: ${{ secrets.K8S_CLIENT_CERT }}
+          KEY_B64: ${{ secrets.K8S_CLIENT_KEY }}
+          CA_B64: ${{ secrets.K8S_CA_CERT }}
+          K8S_HOST: ${{ vars.K8S_HOST }}
+          K8S_PORT: ${{ vars.K8S_PORT }}
+          K8S_EXPECTED_API_SERVER: ${{ vars.K8S_EXPECTED_API_SERVER }}
+          K8S_EXPECTED_CA_SHA256: ${{ vars.K8S_EXPECTED_CA_SHA256 }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+        run: |
+          set -eu
+          : "${K8S_EXPECTED_API_SERVER:?required}"; : "${K8S_EXPECTED_CA_SHA256:?required}"; : "${K8S_NAMESPACE:?required}"; : "${IMAGE_DIGEST:?required immutable digest}"
+          test "${IMAGE_DIGEST#*@sha256:}" != "${IMAGE_DIGEST}"
+          echo "$CERT_B64" | base64 -d > /tmp/k8s-cert.pem
+          echo "$KEY_B64" | base64 -d > /tmp/k8s-key.pem
+          echo "$CA_B64" | base64 -d > /tmp/k8s-ca.pem
+          openssl x509 -in /tmp/k8s-ca.pem -outform DER -out /tmp/k8s-ca.der
+          test "$(sha256sum /tmp/k8s-ca.der | cut -d ' ' -f1)" = "$K8S_EXPECTED_CA_SHA256"
+          kubectl config set-cluster k8s --server="https://${K8S_HOST}:${K8S_PORT}" --certificate-authority=/tmp/k8s-ca.pem --tls-server-name=kubernetes
+          kubectl config set-credentials admin --client-certificate=/tmp/k8s-cert.pem --client-key=/tmp/k8s-key.pem
+          kubectl config set-context production --cluster=k8s --user=admin --namespace="${K8S_NAMESPACE}"
+          kubectl config use-context production
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "$K8S_EXPECTED_API_SERVER"
+          require_can_i() {
+            test "$(kubectl auth can-i "$@")" = "yes"
+          }
+          require_can_i get pods -n "${K8S_NAMESPACE}"
+          require_can_i create deployments.apps -n "${K8S_NAMESPACE}"
+          require_can_i create secrets -n "${K8S_NAMESPACE}"
+          require_can_i create statefulsets.apps -n "${K8S_NAMESPACE}"
+          require_can_i create ingresses.networking.k8s.io -n "${K8S_NAMESPACE}"
+          kubectl create configmap preflight-admission-check --from-literal=commit="${{ github.sha }}" -n "${K8S_NAMESPACE}" --dry-run=server -o yaml >/dev/null
+          jq -n --arg api "$K8S_EXPECTED_API_SERVER" --arg ca "$K8S_EXPECTED_CA_SHA256" --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg run "$GITHUB_RUN_ID" '{status:"PASS",api_server:$api,ca_sha256:$ca,commit_sha:$sha,ref:$ref,run_id:$run}' > preflight.json
+          jq -e --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg api "$K8S_EXPECTED_API_SERVER" --arg ca "$K8S_EXPECTED_CA_SHA256" '.status == "PASS" and .api_server == $api and .ca_sha256 == $ca and .commit_sha == $sha and .ref == $ref and (.run_id|tostring) == (env.GITHUB_RUN_ID|tostring)' preflight.json >/dev/null
+      - name: Render manifests
+        env:
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          TLS_SECRET: ${{ vars.TLS_SECRET }}
+          MIDDLEWARE: ${{ vars.MIDDLEWARE }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+        run: |
+          set -eu
+          sed -i "s|__IMAGE_TAG__|${IMAGE_DIGEST}|g" k8s/app/deployment.yaml
+          sed -i "s|\${APP_NAME}|${APP_NAME}|g" k8s/app/*.yaml k8s/postgres/*.yaml k8s/ingress*.yaml
+          sed -i "s|\${K8S_NAMESPACE}|${K8S_NAMESPACE}|g" k8s/app/*.yaml k8s/postgres/*.yaml k8s/ingress*.yaml
+          sed -i "s|\${DOMAIN}|${DOMAIN}|g" k8s/ingress*.yaml
+          sed -i "s|\${TLS_SECRET}|${TLS_SECRET}|g" k8s/ingress*.yaml
+          sed -i "s|\${MIDDLEWARE}|${MIDDLEWARE}|g" k8s/ingress-http.yaml
+          ! grep -rn '__IMAGE_TAG__\|${APP_NAME}\|${K8S_NAMESPACE}\|${DOMAIN}\|${TLS_SECRET}\|${MIDDLEWARE}' k8s/*.yaml k8s/app k8s/postgres
+      - name: Server-side dry-run
+        run: |
+          set -eu
+          kubectl apply --server-side --dry-run=server -f k8s/app/ -f k8s/postgres/ -f k8s/ingress.yaml -f k8s/ingress-http.yaml
+      - name: Deploy app
+        env:
+          K8S_CERT_B64: ${{ secrets.K8S_CLIENT_CERT }}
+          K8S_KEY_B64: ${{ secrets.K8S_CLIENT_KEY }}
+          K8S_CA_CERT: ${{ secrets.K8S_CA_CERT }}
+          K8S_HOST: ${{ vars.K8S_HOST }}
+          K8S_PORT: ${{ vars.K8S_PORT }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_digest }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          TLS_SECRET: ${{ vars.TLS_SECRET }}
+          MIDDLEWARE: ${{ vars.MIDDLEWARE }}
+        run: |
+          set -eu
+          test "${IMAGE_TAG#*@sha256:}" != "${IMAGE_TAG}"
+          test -n "${APP_NAME}" && test -n "${DOMAIN}" && test -n "${K8S_NAMESPACE}"
+          echo "$K8S_CA_CERT" | base64 -d > /tmp/k8s-ca.pem
+          python3 k8s/deploy.py
+      - name: Wait for rollout and readiness
+        env:
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -eu
+          kubectl rollout status statefulset/"${APP_NAME}-postgres" -n "${K8S_NAMESPACE}" --timeout=180s
+          kubectl rollout status deployment/"${APP_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
+          sleep 5
+          READY=$(kubectl get pods -l app="${APP_NAME}" -n "${K8S_NAMESPACE}" --no-headers | awk '$2=="1/1"' | wc -l)
+          if [ "$READY" -lt 1 ]; then
+            echo "ERROR: no ready pods for ${APP_NAME}"
+            kubectl logs -l app="${APP_NAME}" -n "${K8S_NAMESPACE}" --tail=50 || true
+            exit 1
+          fi
+          kubectl get endpoints "${APP_NAME}" -n "${K8S_NAMESPACE}" -o jsonpath='{.subsets[*].addresses[*].ip}' | grep -q .
+      - name: Smoke test
+        env:
+          DOMAIN: ${{ vars.DOMAIN }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -eu
+          for i in $(seq 1 8); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${DOMAIN}/api/health" || true)
+            echo "attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              BODY=$(curl -s --max-time 10 "https://${DOMAIN}/api/health")
+              echo "$BODY" | grep -q '"status":"ok"' && { echo "SMOKE TEST PASSED"; exit 0; }
+            fi
+            sleep 10
+          done
+          echo "SMOKE TEST FAILED"; exit 1
+      - name: Functional probe (create + list + delete cascade)
+        env:
+          DOMAIN: ${{ vars.DOMAIN }}
+        run: |
+          set -eu
+          CODE=$(curl -s -o /tmp/class.json -w "%{http_code}" --max-time 10 -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"name":"smoke-class","teacher":"ci","room":"000"}' \
+            "https://${DOMAIN}/api/classes")
+          test "$CODE" = "201"
+          CLASS_ID=$(jq -r '.id' /tmp/class.json)
+          test "$CLASS_ID" != "null" && test "$CLASS_ID" -gt 0
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"name":"smoke-student","age":10,"gender":"x"}' \
+            "https://${DOMAIN}/api/classes/${CLASS_ID}/students")
+          test "$CODE" = "201"
+          COUNT=$(curl -s --max-time 10 "https://${DOMAIN}/api/classes" | jq '[.[] | select(.id == '"$CLASS_ID"')] | length')
+          test "$COUNT" = "1"
+          echo "FUNCTIONAL PROBE PASSED (class_id=$CLASS_ID)"

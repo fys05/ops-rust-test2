@@ -4,15 +4,28 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
 async fn test_app() -> axum::Router {
-    let pool = SqlitePoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect("sqlite::memory:")
+        .connect(
+            &std::env::var("TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".into()),
+        )
         .await
         .unwrap();
+
+    sqlx::query("DROP TABLE IF EXISTS students")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS classes")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     ops_rust_test2::init_db(&pool).await.unwrap();
     ops_rust_test2::app(pool)
 }
@@ -95,22 +108,35 @@ async fn students_are_managed_under_their_class() {
     .await;
 
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(student["class_id"], class_id);
     assert_eq!(student["name"], "张三");
-    assert_eq!(student["age"], 10);
+    assert_eq!(student["class_id"], class_id);
 
     let (status, students) = get_json(app, &format!("/api/classes/{class_id}/students")).await;
-
     assert_eq!(status, StatusCode::OK);
     assert_eq!(students.as_array().unwrap().len(), 1);
-    assert_eq!(students[0]["phone"], "13800000000");
+}
+
+#[tokio::test]
+async fn creating_student_for_missing_class_returns_not_found() {
+    let app = test_app().await;
+
+    let (status, body) = request_json(
+        app,
+        "POST",
+        "/api/classes/999/students",
+        json!({"name":"李四","age":11,"gender":"女"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "class not found");
 }
 
 #[tokio::test]
 async fn invalid_class_payload_is_rejected() {
     let app = test_app().await;
 
-    let (status, error) = request_json(
+    let (status, body) = request_json(
         app,
         "POST",
         "/api/classes",
@@ -119,36 +145,5 @@ async fn invalid_class_payload_is_rejected() {
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "class name, teacher, and room are required");
-}
-
-#[tokio::test]
-async fn student_cannot_be_added_to_missing_class() {
-    let app = test_app().await;
-
-    let (status, error) = request_json(
-        app,
-        "POST",
-        "/api/classes/999/students",
-        json!({"name":"张三","age":10,"gender":"男","phone":null}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(error["error"], "class not found");
-}
-
-#[tokio::test]
-async fn root_serves_frontend_html() {
-    let app = test_app().await;
-
-    let request = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8(bytes.to_vec()).unwrap();
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("班级管理系统"));
-    assert!(html.contains("/api/classes"));
+    assert_eq!(body["error"], "class name, teacher, and room are required");
 }

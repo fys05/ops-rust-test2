@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${APP_NAME}-postgres
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: ${APP_NAME}-postgres
+spec:
+  serviceName: ${APP_NAME}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${APP_NAME}-postgres
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: ${APP_NAME}-postgres-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: nfs142
+        resources:
+          requests:
+            storage: 2Gi

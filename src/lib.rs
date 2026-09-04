@@ -7,12 +7,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Row, SqlitePool};
+use sqlx::{PgPool, Row};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 
 #[derive(Clone)]
 pub struct AppState {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,7 +73,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn app(pool: SqlitePool) -> Router {
+pub fn app(pool: PgPool) -> Router {
     let state = AppState { pool };
 
     Router::new()
@@ -89,15 +89,15 @@ pub fn app(pool: SqlitePool) -> Router {
         .with_state(state)
 }
 
-pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+pub async fn init_db(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS classes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             teacher TEXT NOT NULL,
             room TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         "#,
     )
@@ -107,14 +107,13 @@ pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS students (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            class_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
             age INTEGER NOT NULL,
             gender TEXT NOT NULL,
             phone TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (class_id) REFERENCES classes(id) ON DELETE CASCADE
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         "#,
     )
@@ -166,15 +165,16 @@ async fn create_class(
         ));
     }
 
-    let result = sqlx::query("INSERT INTO classes (name, teacher, room) VALUES (?, ?, ?)")
-        .bind(name)
-        .bind(teacher)
-        .bind(room)
-        .execute(&state.pool)
-        .await?;
+    let row =
+        sqlx::query("INSERT INTO classes (name, teacher, room) VALUES ($1, $2, $3) RETURNING id")
+            .bind(name)
+            .bind(teacher)
+            .bind(room)
+            .fetch_one(&state.pool)
+            .await?;
 
     let class = Class {
-        id: result.last_insert_rowid(),
+        id: row.get("id"),
         name: name.to_owned(),
         teacher: teacher.to_owned(),
         room: room.to_owned(),
@@ -193,7 +193,7 @@ async fn list_students(
         r#"
         SELECT id, class_id, name, age, gender, phone
         FROM students
-        WHERE class_id = ?
+        WHERE class_id = $1
         ORDER BY id DESC
         "#,
     )
@@ -238,19 +238,19 @@ async fn create_student(
         ));
     }
 
-    let result = sqlx::query(
-        "INSERT INTO students (class_id, name, age, gender, phone) VALUES (?, ?, ?, ?, ?)",
+    let row = sqlx::query(
+        "INSERT INTO students (class_id, name, age, gender, phone) VALUES ($1, $2, $3, $4, $5) RETURNING id",
     )
     .bind(class_id)
     .bind(name)
     .bind(payload.age)
     .bind(gender)
     .bind(&phone)
-    .execute(&state.pool)
+    .fetch_one(&state.pool)
     .await?;
 
     let student = Student {
-        id: result.last_insert_rowid(),
+        id: row.get("id"),
         class_id,
         name: name.to_owned(),
         age: payload.age,
@@ -261,8 +261,8 @@ async fn create_student(
     Ok((StatusCode::CREATED, Json(student)))
 }
 
-async fn ensure_class_exists(pool: &SqlitePool, class_id: i64) -> Result<(), ApiError> {
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM classes WHERE id = ?")
+async fn ensure_class_exists(pool: &PgPool, class_id: i64) -> Result<(), ApiError> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM classes WHERE id = $1")
         .bind(class_id)
         .fetch_optional(pool)
         .await?;

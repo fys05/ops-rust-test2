@@ -1,6 +1,6 @@
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use std::{net::SocketAddr, str::FromStr};
+use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -14,18 +14,13 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:class_manager.db".to_owned());
+    let database_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL is required (e.g. postgres://user:pass@host:5432/db)")?;
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned());
 
-    let options = SqliteConnectOptions::from_str(&database_url)
-        .with_context(|| format!("invalid DATABASE_URL: {database_url}"))?
-        .create_if_missing(true)
-        .foreign_keys(true);
-
-    let pool = SqlitePoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect_with(options)
+        .connect(&database_url)
         .await
         .context("connect database")?;
 
