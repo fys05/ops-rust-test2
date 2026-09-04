@@ -179,8 +179,9 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -eu
-          kubectl rollout status statefulset/"${APP_NAME}-postgres" -n "${K8S_NAMESPACE}" --timeout=180s
-          kubectl rollout status deployment/"${APP_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
+          kubectl rollout status statefulset/"${APP_NAME}-postgres" -n "${K8S_NAMESPACE}" --timeout=300s
+          # cold ghcr pull on a fresh node exceeded 180s in run 33833407807; allow 600s
+          kubectl rollout status deployment/"${APP_NAME}" -n "${K8S_NAMESPACE}" --timeout=600s
           sleep 5
           READY=$(kubectl get pods -l app="${APP_NAME}" -n "${K8S_NAMESPACE}" --no-headers | awk '$2=="1/1"' | wc -l)
           if [ "$READY" -lt 1 ]; then
